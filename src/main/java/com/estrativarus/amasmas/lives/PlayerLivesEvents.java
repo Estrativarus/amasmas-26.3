@@ -1,17 +1,29 @@
 package com.estrativarus.amasmas.lives;
 
 import com.estrativarus.amasmas.Amasmas;
+import com.mojang.logging.LogUtils;
 import net.minecraft.ChatFormatting;
+import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.game.ClientboundSetSubtitleTextPacket;
+import net.minecraft.network.protocol.game.ClientboundSetTitleTextPacket;
+import net.minecraft.network.protocol.game.ClientboundSetTitlesAnimationPacket;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.permissions.Permissions;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.phys.Vec3;
+import net.neoforged.bus.api.EventPriority;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.event.entity.living.LivingDeathEvent;
 import net.neoforged.neoforge.event.entity.living.LivingDropsEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
+import net.neoforged.neoforge.event.server.ServerStartedEvent;
+import org.slf4j.Logger;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -19,247 +31,144 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
-import net.minecraft.commands.CommandSourceStack;
-import net.minecraft.network.protocol.game.ClientboundSetSubtitleTextPacket;
-import net.minecraft.network.protocol.game.ClientboundSetTitleTextPacket;
-import net.minecraft.network.protocol.game.ClientboundSetTitlesAnimationPacket;
-import net.minecraft.sounds.SoundEvents;
-import net.minecraft.sounds.SoundSource;
-import net.minecraft.world.level.Level;
-import net.neoforged.neoforge.event.server.ServerStartedEvent;
-import net.minecraft.commands.CommandSourceStack;
-import net.minecraft.server.permissions.Permissions;
-import net.neoforged.neoforge.event.entity.player.PlayerEvent;
-import java.util.HashSet;
-import java.util.Set;
-
 @EventBusSubscriber(modid = Amasmas.MOD_ID)
 public class PlayerLivesEvents {
 
+    private static final Logger LOGGER = LogUtils.getLogger();
+
     /*
-     * Inventarios pendientes de restaurar.
-     *
-     * Solo existen durante el proceso:
-     *
-     * muerte -> pantalla de muerte -> reaparición
-     *
-     * No necesitan guardarse en disco porque normalmente este proceso
-     * dura unos segundos y el servidor continúa encendido.
+     * Inventarios pendientes de restaurar (muerte -> reaparición).
+     * Que exista una entrada aquí es lo que decide si se cancelan los drops.
      */
     private static final Map<UUID, List<ItemStack>>
             INVENTARIOS_PENDIENTES = new HashMap<>();
 
     /*
-     * Marca qué jugadores deben conservar el inventario.
-     *
-     * LivingDeathEvent decide si deben conservarlo.
-     * LivingDropsEvent cancela sus objetos soltados.
+     * Lugar de la muerte, para soltar los objetos si el jugador
+     * se desconecta antes de reaparecer.
      */
-    private static final Map<UUID, Boolean>
-            CONSERVAR_INVENTARIO = new HashMap<>();
+    private record PosicionMuerte(ServerLevel nivel, Vec3 pos) {}
+
+    private static final Map<UUID, PosicionMuerte>
+            POSICIONES_MUERTE = new HashMap<>();
 
     /*
-     * Jugadores que han consumido su última vida y deben
-     * ser procesados cuando reaparezcan.
+     * LOWEST: solo contamos muertes que otros listeners no hayan cancelado.
      */
-    private static final Set<UUID> ELIMINACIONES_PENDIENTES =
-            new HashSet<>();
+    @SubscribeEvent(priority = EventPriority.LOWEST)
+    public static void onPlayerDeath(LivingDeathEvent event) {
 
-    @SubscribeEvent
-    public static void onPlayerDeath(
-            LivingDeathEvent event
-    ) {
-
-        if (!(event.getEntity() instanceof ServerPlayer player)) {
-            return;
-        }
-
-        if (!(player.level() instanceof ServerLevel level)) {
-            return;
-        }
+        if (!(event.getEntity() instanceof ServerPlayer player)) return;
+        if (!(player.level() instanceof ServerLevel level)) return;
 
         MinecraftServer server = level.getServer();
+        UUID uuid = player.getUUID();
 
-        PlayerLivesSavedData datos =
-                PlayerLivesSavedData.get(server);
+        LOGGER.info("[Vidas] Muerte detectada: {} ({}) causa={}",
+                player.getGameProfile().name(), uuid,
+                event.getSource().type().msgId());
 
-        double muerteX =
-                player.getX();
-
-        double muerteY =
-                player.getY();
-
-        double muerteZ =
-                player.getZ();
-
-        String nombreJugador =
-                player.getName().getString();
-
-        server.execute(() ->
-                mostrarAvisoGlobalDeMuerte(
-                        server,
-                        nombreJugador,
-                        level,
-                        muerteX,
-                        muerteY,
-                        muerteZ
-                )
-        );
-
-        /*
-         * Restamos la vida primero.
-         *
-         * 3 -> 2: conserva
-         * 2 -> 1: conserva
-         * 1 -> 0: pierde
-         */
-        int vidasRestantes =
-                datos.registrarMuerte(player.getUUID());
-
-        /*
-         * Si acaba de gastar su última vida, lo procesaremos
-         * cuando pulse "Reaparecer".
-         */
-        if (vidasRestantes == 0) {
-            ELIMINACIONES_PENDIENTES.add(
-                    player.getUUID()
-            );
-        }
-
-        boolean debeConservar =
-                vidasRestantes > 0;
-
-        CONSERVAR_INVENTARIO.put(
-                player.getUUID(),
-                debeConservar
-        );
+        // 1) Lo crítico primero: vidas e inventario.
+        PlayerLivesSavedData datos = PlayerLivesSavedData.get(server);
+        int vidasRestantes = datos.registrarMuerte(uuid);
+        boolean debeConservar = vidasRestantes > 0;
 
         if (debeConservar) {
-
-            /*
-             * Guardamos una copia de cada posición del inventario.
-             *
-             * Incluye inventario principal, barra rápida,
-             * armadura y mano secundaria según el contenedor
-             * de inventario del jugador.
-             */
-            List<ItemStack> copiaInventario =
-                    new ArrayList<>();
-
-            for (
-                    int slot = 0;
-                    slot < player.getInventory().getContainerSize();
-                    slot++
-            ) {
-                copiaInventario.add(
-                        player
-                                .getInventory()
-                                .getItem(slot)
-                                .copy()
-                );
+            List<ItemStack> copia = new ArrayList<>();
+            for (int i = 0; i < player.getInventory().getContainerSize(); i++) {
+                copia.add(player.getInventory().getItem(i).copy());
             }
-
-            INVENTARIOS_PENDIENTES.put(
-                    player.getUUID(),
-                    copiaInventario
-            );
+            INVENTARIOS_PENDIENTES.put(uuid, copia);
+            POSICIONES_MUERTE.put(uuid, new PosicionMuerte(level, player.position()));
         }
 
-        enviarMensajeVidas(
-                player,
-                vidasRestantes,
-                debeConservar
-        );
+        // 2) Lo cosmético, aislado para que un fallo no afecte al inventario.
+        try {
+            double x = player.getX();
+            double y = player.getY();
+            double z = player.getZ();
+            String nombre = player.getName().getString();
+
+            server.execute(() -> {
+                try {
+                    mostrarAvisoGlobalDeMuerte(server, nombre, level, x, y, z);
+                } catch (Throwable t) {
+                    LOGGER.error("[Vidas] Error mostrando el aviso de muerte", t);
+                }
+            });
+
+            enviarMensajeVidas(player, vidasRestantes, debeConservar);
+        } catch (Throwable t) {
+            LOGGER.error("[Vidas] Error en las notificaciones de muerte", t);
+        }
     }
 
     /*
-     * Evitamos que aparezcan objetos en el suelo durante
-     * las dos primeras muertes.
+     * Solo cancelamos los drops si tenemos copia del inventario.
      */
     @SubscribeEvent
-    public static void onPlayerDrops(
-            LivingDropsEvent event
-    ) {
+    public static void onPlayerDrops(LivingDropsEvent event) {
 
-        if (!(event.getEntity() instanceof ServerPlayer player)) {
-            return;
-        }
+        if (!(event.getEntity() instanceof ServerPlayer player)) return;
 
-        boolean debeConservar =
-                CONSERVAR_INVENTARIO.getOrDefault(
-                        player.getUUID(),
-                        false
-                );
-
-        if (debeConservar) {
+        if (INVENTARIOS_PENDIENTES.containsKey(player.getUUID())) {
             event.setCanceled(true);
         }
     }
 
     /*
-     * Restauramos el inventario en el nuevo objeto jugador
-     * que Minecraft crea al reaparecer.
+     * Restauramos el inventario en el nuevo jugador creado al reaparecer.
      */
     @SubscribeEvent
-    public static void onPlayerClone(
-            PlayerEvent.Clone event
-    ) {
+    public static void onPlayerClone(PlayerEvent.Clone event) {
 
-        if (!event.isWasDeath()) {
-            return;
-        }
+        if (!event.isWasDeath()) return;
 
         UUID uuid = event.getEntity().getUUID();
 
-        boolean debeConservar =
-                CONSERVAR_INVENTARIO.getOrDefault(
-                        uuid,
-                        false
-                );
+        List<ItemStack> copia = INVENTARIOS_PENDIENTES.remove(uuid);
+        POSICIONES_MUERTE.remove(uuid);
 
-        if (!debeConservar) {
-            limpiarDatosTemporales(uuid);
-            return;
-        }
+        if (copia == null) return;
 
-        List<ItemStack> copiaInventario =
-                INVENTARIOS_PENDIENTES.get(uuid);
-
-        if (copiaInventario == null) {
-            limpiarDatosTemporales(uuid);
-            return;
-        }
-
-        /*
-         * Evitamos superar el número de slots que tenga
-         * el inventario del jugador nuevo.
-         */
-        int cantidadSlots =
-                Math.min(
-                        copiaInventario.size(),
-                        event
-                                .getEntity()
-                                .getInventory()
-                                .getContainerSize()
-                );
+        var inventario = event.getEntity().getInventory();
+        int cantidadSlots = Math.min(copia.size(), inventario.getContainerSize());
 
         for (int slot = 0; slot < cantidadSlots; slot++) {
-
-            event
-                    .getEntity()
-                    .getInventory()
-                    .setItem(
-                            slot,
-                            copiaInventario
-                                    .get(slot)
-                                    .copy()
-                    );
+            inventario.setItem(slot, copia.get(slot).copy());
         }
 
-        event.getEntity().getInventory().setChanged();
+        inventario.setChanged();
 
-        limpiarDatosTemporales(uuid);
+        LOGGER.info("[Vidas] Inventario restaurado para {}", uuid);
     }
+
+    /*
+     * Si el jugador se desconecta con el inventario pendiente
+     * (por ejemplo, desde la pantalla de muerte), lo soltamos
+     * en el lugar de la muerte en vez de perderlo.
+     */
+    @SubscribeEvent
+    public static void onPlayerLogout(PlayerEvent.PlayerLoggedOutEvent event) {
+
+        if (!(event.getEntity() instanceof ServerPlayer player)) return;
+
+        UUID uuid = player.getUUID();
+        List<ItemStack> pendientes = INVENTARIOS_PENDIENTES.remove(uuid);
+        PosicionMuerte p = POSICIONES_MUERTE.remove(uuid);
+
+        if (pendientes == null || p == null) return;
+
+        LOGGER.warn("[Vidas] {} se desconectó sin reaparecer; soltando su inventario", uuid);
+
+        for (ItemStack stack : pendientes) {
+            if (!stack.isEmpty()) {
+                p.nivel().addFreshEntity(new ItemEntity(
+                        p.nivel(), p.pos().x, p.pos().y, p.pos().z, stack));
+            }
+        }
+    }
+
     private static void mostrarAvisoGlobalDeMuerte(
             MinecraftServer server,
             String nombreJugador,
@@ -269,239 +178,82 @@ public class PlayerLivesEvents {
             double muerteZ
     ) {
 
-        /*
-         * Título principal en rojo.
-         */
         Component titulo =
                 Component.literal("¡MUERTO!")
-                        .withStyle(
-                                ChatFormatting.RED,
-                                ChatFormatting.BOLD
-                        );
+                        .withStyle(ChatFormatting.RED, ChatFormatting.BOLD);
 
-        /*
-         * Subtítulo:
-         *
-         * Nombre en dorado.
-         * "ha muerto" en gris.
-         */
         Component subtitulo =
                 Component.empty()
+                        .append(Component.literal(nombreJugador)
+                                .withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD))
+                        .append(Component.literal(" ha muerto")
+                                .withStyle(ChatFormatting.GRAY));
 
-                        .append(
-                                Component.literal(nombreJugador)
-                                        .copy()
-                                        .withStyle(
-                                                ChatFormatting.GOLD,
-                                                ChatFormatting.BOLD
-                                        )
-                        )
+        for (ServerPlayer jugador : server.getPlayerList().getPlayers()) {
 
-                        .append(
-                                Component.literal(" ha muerto")
-                                        .withStyle(
-                                                ChatFormatting.GRAY
-                                        )
-                        );
-
-        /*
-         * Recorremos todos los jugadores conectados.
-         */
-        for (
-                ServerPlayer jugador :
-                server.getPlayerList().getPlayers()
-        ) {
-
-            /*
-             * Tiempos del título, medidos en ticks:
-             *
-             * 10 ticks: entrada de 0,5 segundos.
-             * 70 ticks: visible durante 3,5 segundos.
-             * 20 ticks: salida de 1 segundo.
-             */
+            // 10 ticks de entrada, 70 visible, 20 de salida.
             jugador.connection.send(
-                    new ClientboundSetTitlesAnimationPacket(
-                            10,
-                            70,
-                            20
-                    )
-            );
-
-            /*
-             * Enviamos primero el subtítulo y después el título.
-             */
-            jugador.connection.send(
-                    new ClientboundSetSubtitleTextPacket(
-                            subtitulo
-                    )
-            );
+                    new ClientboundSetTitlesAnimationPacket(10, 70, 20));
 
             jugador.connection.send(
-                    new ClientboundSetTitleTextPacket(
-                            titulo
-                    )
-            );
+                    new ClientboundSetSubtitleTextPacket(subtitulo));
 
+            jugador.connection.send(
+                    new ClientboundSetTitleTextPacket(titulo));
         }
-        /*
-         * Reproducimos el sonido individualmente en la posición
-         * de cada jugador conectado.
-         *
-         * El pitch 0.5 hace que el sonido sea más grave.
-         */
-        server.execute(() -> {
 
-            CommandSourceStack source =
-                    server
-                            .createCommandSourceStack()
-                            .withSuppressedOutput();
+        CommandSourceStack source =
+                server.createCommandSourceStack().withSuppressedOutput();
 
-            server.getCommands().performPrefixedCommand(
-                    source,
-                    "execute as @a at @s run playsound "
-                            + "minecraft:entity.wither.death "
-                            + "master @s ~ ~ ~ 1 0.5"
-            );
-        });
+        server.getCommands().performPrefixedCommand(
+                source,
+                "execute as @a at @s run playsound "
+                        + "minecraft:entity.wither.death "
+                        + "master @s ~ ~ ~ 1 0.5"
+        );
 
-        /*
-         * Mensaje personalizado del chat.
-         */
         Component mensajeChat =
                 Component.empty()
+                        .append(Component.literal("¡MUERTO! ")
+                                .withStyle(ChatFormatting.RED, ChatFormatting.BOLD))
+                        .append(Component.literal(nombreJugador)
+                                .withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD))
+                        .append(Component.literal(" ha muerto.")
+                                .withStyle(ChatFormatting.GRAY));
 
-                        .append(
-                                Component.literal("¡MUERTO! ")
-                                        .withStyle(
-                                                ChatFormatting.RED,
-                                                ChatFormatting.BOLD
-                                        )
-                        )
+        server.getPlayerList().broadcastSystemMessage(mensajeChat, false);
 
-                        .append(
-                                Component.literal(nombreJugador)
-                                        .copy()
-                                        .withStyle(
-                                                ChatFormatting.GOLD,
-                                                ChatFormatting.BOLD
-                                        )
-                        )
+        // floor para que las coordenadas negativas se redondeen bien.
+        int x = (int) Math.floor(muerteX);
+        int y = (int) Math.floor(muerteY);
+        int z = (int) Math.floor(muerteZ);
 
-                        .append(
-                                Component.literal(" ha muerto.")
-                                        .withStyle(
-                                                ChatFormatting.GRAY
-                                        )
-                        );
-
-        server.getPlayerList().broadcastSystemMessage(
-                mensajeChat,
-                false
-        );
-
-        /*
-         * Coordenadas del lugar de la muerte.
-         *
-         * floor convierte correctamente coordenadas negativas:
-         *
-         * -3.7 pasa a -4, no a -3.
-         */
-        int x =
-                (int) Math.floor(muerteX);
-
-        int y =
-                (int) Math.floor(muerteY);
-
-        int z =
-                (int) Math.floor(muerteZ);
-
-        String nombreDimension =
-                obtenerNombreDimension(nivel);
-
-        /*
-         * Mensaje con dimensión y coordenadas.
-         */
         Component mensajeUbicacion =
                 Component.empty()
+                        .append(Component.literal("Lugar de la muerte: ")
+                                .withStyle(ChatFormatting.DARK_RED, ChatFormatting.BOLD))
+                        .append(Component.literal(obtenerNombreDimension(nivel))
+                                .withStyle(ChatFormatting.LIGHT_PURPLE, ChatFormatting.BOLD))
+                        .append(Component.literal(" | ")
+                                .withStyle(ChatFormatting.DARK_GRAY))
+                        .append(Component.literal("X: ")
+                                .withStyle(ChatFormatting.GRAY))
+                        .append(Component.literal(String.valueOf(x))
+                                .withStyle(ChatFormatting.AQUA))
+                        .append(Component.literal("  Y: ")
+                                .withStyle(ChatFormatting.GRAY))
+                        .append(Component.literal(String.valueOf(y))
+                                .withStyle(ChatFormatting.AQUA))
+                        .append(Component.literal("  Z: ")
+                                .withStyle(ChatFormatting.GRAY))
+                        .append(Component.literal(String.valueOf(z))
+                                .withStyle(ChatFormatting.AQUA));
 
-                        .append(
-                                Component.literal("Lugar de la muerte: ")
-                                        .withStyle(
-                                                ChatFormatting.DARK_RED,
-                                                ChatFormatting.BOLD
-                                        )
-                        )
-
-                        .append(
-                                Component.literal(nombreDimension)
-                                        .withStyle(
-                                                ChatFormatting.LIGHT_PURPLE,
-                                                ChatFormatting.BOLD
-                                        )
-                        )
-
-                        .append(
-                                Component.literal(" | ")
-                                        .withStyle(
-                                                ChatFormatting.DARK_GRAY
-                                        )
-                        )
-
-                        .append(
-                                Component.literal("X: ")
-                                        .withStyle(
-                                                ChatFormatting.GRAY
-                                        )
-                        )
-
-                        .append(
-                                Component.literal(String.valueOf(x))
-                                        .withStyle(
-                                                ChatFormatting.AQUA
-                                        )
-                        )
-
-                        .append(
-                                Component.literal("  Y: ")
-                                        .withStyle(
-                                                ChatFormatting.GRAY
-                                        )
-                        )
-
-                        .append(
-                                Component.literal(String.valueOf(y))
-                                        .withStyle(
-                                                ChatFormatting.AQUA
-                                        )
-                        )
-
-                        .append(
-                                Component.literal("  Z: ")
-                                        .withStyle(
-                                                ChatFormatting.GRAY
-                                        )
-                        )
-
-                        .append(
-                                Component.literal(String.valueOf(z))
-                                        .withStyle(
-                                                ChatFormatting.AQUA
-                                        )
-                        );
-
-        server.getPlayerList().broadcastSystemMessage(
-                mensajeUbicacion,
-                false
-        );
+        server.getPlayerList().broadcastSystemMessage(mensajeUbicacion, false);
     }
 
-    private static String obtenerNombreDimension(
-            ServerLevel nivel
-    ) {
+    private static String obtenerNombreDimension(ServerLevel nivel) {
 
-        /*
-         * Dimensiones vanilla.
-         */
         if (nivel.dimension().equals(Level.OVERWORLD)) {
             return "Overworld";
         }
@@ -514,22 +266,8 @@ public class PlayerLivesEvents {
             return "The End";
         }
 
-        /*
-         * Si la muerte ocurre en una dimensión de otro mod,
-         * mostramos su identificador completo.
-         *
-         * Ejemplo:
-         *
-         * otro_mod:dimension_especial
-         */
+        // Dimensión de otro mod: mostramos su identificador.
         return nivel.dimension().toString();
-    }
-
-    private static void limpiarDatosTemporales(
-            UUID uuid
-    ) {
-        INVENTARIOS_PENDIENTES.remove(uuid);
-        CONSERVAR_INVENTARIO.remove(uuid);
     }
 
     private static void enviarMensajeVidas(
@@ -539,52 +277,27 @@ public class PlayerLivesEvents {
     ) {
 
         Component mensaje = Component.empty()
-
-                .append(
-                        Component.literal("Has perdido una vida. ")
-                                .withStyle(ChatFormatting.RED)
-                )
-
-                .append(
-                        Component.literal("Vidas restantes: ")
-                                .withStyle(ChatFormatting.GOLD)
-                )
-
-                .append(
-                        Component.literal(
-                                String.valueOf(vidasRestantes)
-                        ).withStyle(
-                                colorSegunVidas(vidasRestantes),
-                                ChatFormatting.BOLD
-                        )
-                );
+                .append(Component.literal("Has perdido una vida. ")
+                        .withStyle(ChatFormatting.RED))
+                .append(Component.literal("Vidas restantes: ")
+                        .withStyle(ChatFormatting.GOLD))
+                .append(Component.literal(String.valueOf(vidasRestantes))
+                        .withStyle(colorSegunVidas(vidasRestantes), ChatFormatting.BOLD));
 
         player.sendSystemMessage(mensaje);
 
         if (conservaInventario) {
-
             player.sendSystemMessage(
-                    Component.literal(
-                            "Has conservado tu inventario."
-                    ).withStyle(ChatFormatting.GREEN)
-            );
-
+                    Component.literal("Has conservado tu inventario.")
+                            .withStyle(ChatFormatting.GREEN));
         } else {
-
             player.sendSystemMessage(
-                    Component.literal(
-                            "No te quedan vidas: tus objetos se han soltado."
-                    ).withStyle(
-                            ChatFormatting.DARK_RED,
-                            ChatFormatting.BOLD
-                    )
-            );
+                    Component.literal("No te quedan vidas: tus objetos se han soltado.")
+                            .withStyle(ChatFormatting.DARK_RED, ChatFormatting.BOLD));
         }
     }
 
-    private static ChatFormatting colorSegunVidas(
-            int vidas
-    ) {
+    private static ChatFormatting colorSegunVidas(int vidas) {
         return switch (vidas) {
             case 3 -> ChatFormatting.GREEN;
             case 2 -> ChatFormatting.YELLOW;
@@ -594,88 +307,45 @@ public class PlayerLivesEvents {
     }
 
     @SubscribeEvent
-    public static void onServerStarted(
-            ServerStartedEvent event
-    ) {
+    public static void onServerStarted(ServerStartedEvent event) {
 
         MinecraftServer server = event.getServer();
 
-        /*
-         * Desactivamos el mensaje vanilla de muerte.
-         *
-         * El mod enviará un mensaje coloreado propio.
-         */
+        // Desactivamos el mensaje vanilla de muerte: el mod envía el suyo.
         CommandSourceStack source =
-                server
-                        .createCommandSourceStack()
-                        .withSuppressedOutput();
+                server.createCommandSourceStack().withSuppressedOutput();
 
         server.getCommands().performPrefixedCommand(
                 source,
                 "gamerule minecraft:show_death_messages false"
         );
     }
+
     @SubscribeEvent
-    public static void onPlayerRespawn(
-            PlayerEvent.PlayerRespawnEvent event
-    ) {
+    public static void onPlayerRespawn(PlayerEvent.PlayerRespawnEvent event) {
 
-        /*
-         * Si el evento se produjo al salir del End,
-         * no es una reaparición por muerte.
-         */
-        if (event.isEndConquered()) {
-            return;
-        }
+        // Salir del End no es una reaparición por muerte.
+        if (event.isEndConquered()) return;
 
-        if (!(event.getEntity() instanceof ServerPlayer player)) {
-            return;
-        }
+        if (!(event.getEntity() instanceof ServerPlayer player)) return;
 
         UUID uuid = player.getUUID();
+        MinecraftServer server = player.level().getServer();
 
-        /*
-         * Si no está pendiente de eliminación,
-         * no hacemos nada.
-         */
-        if (!ELIMINACIONES_PENDIENTES.remove(uuid)) {
-            return;
-        }
+        // Si aún le quedan vidas, no hacemos nada.
+        if (PlayerLivesSavedData.get(server).getVidas(uuid) > 0) return;
 
-        MinecraftServer server =
-                player.level().getServer();
-
-        /*
-         * Comprobamos si tiene permisos de operador.
-         *
-         * COMMANDS_GAMEMASTER representa el nivel habitual
-         * necesario para administrar la partida.
-         */
         boolean esOperador =
-                player
-                        .permissions()
-                        .hasPermission(
-                                Permissions.COMMANDS_GAMEMASTER
-                        );
+                player.permissions().hasPermission(Permissions.COMMANDS_GAMEMASTER);
 
-        String nombre =
-                player.getGameProfile().name();
+        String nombre = player.getGameProfile().name();
 
-        /*
-         * Ejecutamos el cambio después de terminar por completo
-         * el proceso actual de reaparición.
-         */
+        // Ejecutamos después de terminar el proceso actual de reaparición.
         server.execute(() -> {
 
             CommandSourceStack source =
-                    server
-                            .createCommandSourceStack()
-                            .withSuppressedOutput();
+                    server.createCommandSourceStack().withSuppressedOutput();
 
-            /*
-             * Todos los jugadores eliminados pasan primero
-             * a modo espectador.
-             */
             server.getCommands().performPrefixedCommand(
                     source,
                     "gamemode spectator " + nombre
@@ -686,28 +356,18 @@ public class PlayerLivesEvents {
                 player.sendSystemMessage(
                         Component.literal(
                                 "Has agotado todas tus vidas. Permanecerás como espectador porque eres operador."
-                        ).withStyle(
-                                ChatFormatting.RED,
-                                ChatFormatting.BOLD
-                        )
+                        ).withStyle(ChatFormatting.RED, ChatFormatting.BOLD)
                 );
 
             } else {
 
-                /*
-                 * El comando ban añade al perfil a la lista de
-                 * baneados y expulsa al jugador conectado.
-                 */
                 server.getCommands().performPrefixedCommand(
                         source,
-                        "ban "
-                                + nombre
-                                + " Has agotado todas tus vidas"
+                        "ban " + nombre + " Has agotado todas tus vidas"
                 );
             }
         });
     }
-
 
     private PlayerLivesEvents() {
     }
