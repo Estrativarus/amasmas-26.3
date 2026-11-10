@@ -87,11 +87,20 @@ public class PlayerLivesEvents {
             double x = player.getX();
             double y = player.getY();
             double z = player.getZ();
-            String nombre = player.getName().getString();
+            String mensajeMuerte = event.getSource()
+                    .getLocalizedDeathMessage(player)
+                    .getString();
 
             server.execute(() -> {
                 try {
-                    mostrarAvisoGlobalDeMuerte(server, nombre, level, x, y, z);
+                    mostrarAvisoGlobalDeMuerte(
+                            server,
+                            mensajeMuerte,
+                            level,
+                            x,
+                            y,
+                            z
+                    );
                 } catch (Throwable t) {
                     LOGGER.error("[Vidas] Error mostrando el aviso de muerte", t);
                 }
@@ -171,7 +180,7 @@ public class PlayerLivesEvents {
 
     private static void mostrarAvisoGlobalDeMuerte(
             MinecraftServer server,
-            String nombreJugador,
+            String mensajeMuerte,
             ServerLevel nivel,
             double muerteX,
             double muerteY,
@@ -184,10 +193,9 @@ public class PlayerLivesEvents {
 
         Component subtitulo =
                 Component.empty()
-                        .append(Component.literal(nombreJugador)
-                                .withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD))
-                        .append(Component.literal(" ha muerto")
-                                .withStyle(ChatFormatting.GRAY));
+                        .append(Component.literal(mensajeMuerte)
+                                .withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD));
+
 
         for (ServerPlayer jugador : server.getPlayerList().getPlayers()) {
 
@@ -216,9 +224,7 @@ public class PlayerLivesEvents {
                 Component.empty()
                         .append(Component.literal("¡MUERTO! ")
                                 .withStyle(ChatFormatting.RED, ChatFormatting.BOLD))
-                        .append(Component.literal(nombreJugador)
-                                .withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD))
-                        .append(Component.literal(" ha muerto.")
+                        .append(Component.literal(mensajeMuerte)
                                 .withStyle(ChatFormatting.GRAY));
 
         server.getPlayerList().broadcastSystemMessage(mensajeChat, false);
